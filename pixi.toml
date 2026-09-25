@@ -5,6 +5,17 @@ name = "Template-CVPR26"
 platforms = ["linux-64"]
 version = "0.1.0"
 
+# The kit builds with the system TeX Live (pdflatex, latexmk, bibtex; see CLAUDE.md), not with a
+# conda package: conda-forge has no complete TeX Live. Build artifacts go to build/ (gitignored).
 [tasks]
+build = "latexmk -pdf -interaction=nonstopmode -outdir=build main.tex"
+rebuttal = "latexmk -pdf -interaction=nonstopmode -outdir=build rebuttal.tex"
+# Rebuild on every change of a .tex / .bib file (latexmk's own watcher)
+watch = "latexmk -pdf -pvc -interaction=nonstopmode -outdir=build main.tex"
+clean = "latexmk -C -outdir=build"
+pull = "git pull --ff-only"
+status = "git status --short --branch"
 
 [dependencies]
+git = "*"
+

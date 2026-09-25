@@ -1,0 +1,96 @@
+\section{Methodology}
+\label{sec:methodology}
+
+We model the keyframes of a map as views $1,\dots,n$ with a similarity kernel $\mathbf{K}\in\mathbb{R}^{n\times n}$ over them, and we decide which views to keep from the information each one adds to the others under a Gaussian model on that kernel. Two questions follow from the same quantity: whether an incoming frame carries enough unexplained information to become a keyframe (\cref{sec:method_insertion}), and which existing keyframe can be removed while every view ever inserted stays explained (\cref{sec:method_culling}). The derivations below match the reference implementation, whose store keeps every view ever inserted, culled or not, since the culler needs the culled ones as history.
+
+\subsection{Similarity kernel}
+\label{sec:method_kernel}
+
+$\mathbf{K}$ is a Gram matrix, hence positive semi-definite (PSD) with unit diagonal, $K_{ii}=1$ and $K_{ij}\in[0,1]$. Three constructions share the machinery:
+\begin{itemize}
+    \item \textbf{Descriptors.} Each view carries a unit-norm global descriptor $\mathbf{d}_i$, so $K_{ij}=\mathbf{d}_i^{\!\top}\mathbf{d}_j$ is the cosine similarity. A new view appends one row of dot products; no entry is ever recomputed.
+    \item \textbf{Host kernel.} A precomputed $n\times n$ similarity $\mathbf{S}$ is loaded once, symmetrised as $\tfrac12(\mathbf{S}+\mathbf{S}^{\!\top})$, forced to unit diagonal and, when its smallest eigenvalue is negative, projected onto the PSD cone by clipping the spectrum at zero and renormalising, $\mathbf{S}\leftarrow\mathbf{D}^{-1/2}\mathbf{S}\mathbf{D}^{-1/2}$ with $\mathbf{D}=\operatorname{diag}(\mathbf{S})$. A squared-Euclidean distance matrix over unit descriptors converts as $\mathbf{S}=1-\mathbf{D}/2$.
+    \item \textbf{Covisibility.} Each view observes a set $P_i$ of landmark identifiers and
+    \begin{equation}
+        K_{ij}=\frac{|P_i\cap P_j|}{\sqrt{|P_i|\,|P_j|}},
+        \label{eq:covisibility_kernel}
+    \end{equation}
+    the cosine of the indicator vectors: exactly $0$ for views that share nothing, $1$ on the diagonal, PSD by construction. The sets are mutable, since landmarks are created, fused and culled; an inverted index from landmark to views turns a set update into $O(\sum \text{posting lengths})$ increments of an integer shared-count matrix, from which $\mathbf{K}$ is rebuilt lazily.
+\end{itemize}
+
+\paragraph{Centring.}
+Learned image embeddings share a large common-mode component: unrelated places still score well above $0$, which compresses every information score and makes a threshold on it over-sensitive. Double-centring the Gram matrix over the $m$ usable views,
+\begin{equation}
+    \begin{aligned}
+        \mathbf{K}_c&=\mathbf{J}\mathbf{K}\mathbf{J},\qquad \mathbf{J}=\mathbf{I}-\tfrac{1}{m}\mathbf{1}\mathbf{1}^{\!\top},\\
+        C_{ij}&=\frac{(\mathbf{K}_c)_{ij}}{\sqrt{(\mathbf{K}_c)_{ii}(\mathbf{K}_c)_{jj}}},
+    \end{aligned}
+    \label{eq:centring}
+\end{equation}
+gives the correlation of the mean-centred descriptors: unrelated pairs move to about $0$, near-duplicates stay high, and $\mathbf{C}$ remains PSD. Its rank is $m-1$, so every solve below adds a jitter $\varepsilon=10^{-6}$ to the diagonal. The centring set is every stored view, alive and history, so the kernel drifts slightly as the map grows. The covisibility kernel has no common mode and is used raw.
+
+\subsection{Unexplained information}
+\label{sec:method_information}
+
+Let $A$ be the set of alive views. Under a zero-mean Gaussian model whose covariance is $\mathbf{K}$, the information of a view $x$ that the alive views do not explain is its conditional variance,
+\begin{equation}
+    v_x = K_{xx}-\mathbf{k}_{xA}\mathbf{K}_{AA}^{-1}\mathbf{k}_{Ax}\in[0,1],
+    \label{eq:unexplained}
+\end{equation}
+with $\mathbf{k}_{xA}$ the row of similarities between $x$ and $A$. It equals $\exp(-2\,I(x;A))$, the mutual information between the view and the alive set mapped to a unit interval: $v_x=1$ when nothing alive resembles $x$ and $v_x=0$ when $A$ explains it completely. For a view $i$ that is itself alive, the same quantity with respect to the other alive views is read off the inverse of the alive block,
+\begin{equation}
+    v_i=\frac{1}{(\mathbf{K}_{AA}^{-1})_{ii}}=\frac{1}{M_{ii}},\qquad \mathbf{M}=\mathbf{K}_{AA}^{-1},
+    \label{eq:unique_information}
+\end{equation}
+which follows from the Schur complement of the block inverse. We call $v_i$ the unique information of view $i$.
+
+\subsection{Keyframe insertion}
+\label{sec:method_insertion}
+
+A frame is a candidate keyframe when its descriptor, or its set of tracked landmarks, leaves too much unexplained: $v_x\ge\tau_{\text{in}}$ by \cref{eq:unexplained} over the alive views, optionally restricted to the local covisibility window. The query is read-only, costs one dot product per stored view plus a solve of size $|A|$, and never sweeps the $n\times n$ kernel: with centring, the row means $r_i$ and the total mean $t$ of $\mathbf{K}$ are maintained incrementally, and the query is centred out of sample against them,
+\begin{equation}
+    \begin{aligned}
+        c_{xi}&=\frac{k_{xi}-r_x-r_i+t}{\sqrt{C_{xx}\,C_{ii}}},\\
+        r_x&=\frac{1}{m}\sum_{j}k_{xj},\qquad C_{xx}=k_{xx}-2r_x+t,
+    \end{aligned}
+    \label{eq:out_of_sample}
+\end{equation}
+as if $x$ were an extra row that does not contribute to the means. On the raw kernel, $v_x$ equals the unique information $v_i$ the view would have immediately after insertion, by the same Schur identity as \cref{eq:unique_information}; on the centred kernel the equality holds up to the shift of the means that the insertion itself causes.
+
+\subsection{Greedy joint-information culling}
+\label{sec:method_culling}
+
+Culling is the dual decision: remove the alive view that the others explain best, as long as nothing that was ever inserted becomes unexplained. Let $H$ be the history, the views culled earlier, whose kernel rows are kept. Their unexplained information $v_h$ is \cref{eq:unexplained} with $x=h$. Removing an alive view $i$ changes $\mathbf{M}$ by a rank-one downdate and raises every $v_h$ by a closed-form price:
+\begin{align}
+    \mathbf{M}' &= \mathbf{M}-\frac{\mathbf{m}_i\mathbf{m}_i^{\!\top}}{M_{ii}},\qquad \mathbf{m}_i=\mathbf{M}_{:,i},
+    \label{eq:downdate_M}\\
+    \mathbf{W} &= \mathbf{K}_{HA}\mathbf{M},\qquad
+    \mathbf{W}'=\mathbf{W}-\frac{\mathbf{W}_{:,i}\,\mathbf{m}_i^{\!\top}}{M_{ii}},
+    \label{eq:downdate_W}\\
+    v_h' &= v_h+\frac{W_{hi}^2}{M_{ii}}.
+    \label{eq:price}
+\end{align}
+\Cref{eq:downdate_M} is the Sherman--Morrison form of deleting row and column $i$ from the alive block; \cref{eq:price} follows by expanding $\mathbf{k}_{hA}\mathbf{M}'\mathbf{k}_{Ah}$. The culled view joins $H$ with $v_i=1/M_{ii}$, again by the Schur identity, so the history never needs a fresh solve.
+
+The greedy rule culls, one view at a time, the candidate with the smallest unique information among those that keep every view within a budget $\tau$:
+\begin{equation}
+    \begin{aligned}
+        i^\star=\operatorname*{arg\,min}_{i\in A_{\text{cand}}}\; v_i
+        \quad\text{s.t.}\quad & v_i\le\tau,\\
+        & \frac{W_{hi}^2}{M_{ii}}\le\max\!\big(\tau-v_h,\ \delta\big)\quad\forall h\in H,
+    \end{aligned}
+    \label{eq:greedy_rule}
+\end{equation}
+and stops when no candidate is feasible or the alive count reaches a floor. The second constraint is written relative to each history row rather than as $v_h+\text{price}\le\tau$ on purpose: culling is irreversible, so $v_h\le\tau$ only holds for the $\tau$ in force when $h$ was culled. If $\tau$ is lowered later, rows above budget would otherwise make every candidate infeasible and jam the culler; with the relative form they only veto their actual explainers, and the slack $\delta=0.01$ absorbs the numerical dust of the dense $\mathbf{W}$ for unrelated candidates. Candidates are the alive views that are not protected; the first inserted view, the most recent ones and any view the host marks are explainers but never candidates. With $\mathbf{M}$ and $\mathbf{W}$ maintained by \cref{eq:downdate_M,eq:downdate_W}, one cull costs $O(|H||A|+|A|^2)$, and the initial inverse is the only $O(|A|^3)$ step of a call.
+
+\paragraph{Host-executed culls.}
+The culler does not remove anything itself. Each proposal is handed to the host through a callback, which erases the keyframe from its map and reports success; a refusal, for instance because the host defers the erase, leaves the view alive, unchanged in $\mathbf{M}$ and $\mathbf{W}$, and out of the running for the remainder of the call. Only an accepted cull moves the view into $H$. The callback runs with the store unlocked, so the host may take its own map lock inside it.
+
+\paragraph{Local scope.}
+Given the host's covisibility window $\mathcal{W}$, the marginalisation runs over $A\cap\mathcal{W}$ only, and $H$ is reduced to the history rows whose best alive explainer over the whole map lies in $\mathcal{W}$. Far-away history cannot veto a local cull, and far-away views cannot explain a local one.
+
+\paragraph{Count-driven selection.}
+For the offline problem of keeping the $N$ least redundant views of a sequence, the same greedy order runs with $\tau=\infty$, so neither $v_i$ nor the history bounds a cull, and stops when $N$ views are alive. On a raw kernel this is a greedy maximisation of the joint information of the surviving set; the score at which each view is removed rises monotonically along the run.
+
+\paragraph{Degenerate case.}
+Double-centring over a set and marginalising over that same set makes the centred vectors sum to zero, so $\mathbf{K}_{AA}$ is singular whenever the alive set equals the centring set, which happens on the first cull of a map with no history yet. Every $v_i$ is then of the order of the jitter. The insertion query is unaffected, because it excludes itself from the centring set.
